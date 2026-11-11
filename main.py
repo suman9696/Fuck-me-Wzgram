@@ -55,6 +55,49 @@ if ss:
     acc.start()
 else: acc = None
 
+
+# Destination settings. OWNER_ID must be your personal numeric Telegram ID.
+OWNER_ID = int(environ.get("OWNER_ID", "0"))
+TARGET_CHAT_ID = environ.get("TARGET_CHAT_ID", "").strip()
+AUTO_UPLOAD = environ.get("AUTO_UPLOAD", "off").lower() == "on"
+TARGET_CONFIG_FILE = "target_config.json"
+
+def _load_target_config():
+    global TARGET_CHAT_ID, AUTO_UPLOAD
+    try:
+        with open(TARGET_CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        TARGET_CHAT_ID = str(data.get("target_chat_id") or TARGET_CHAT_ID).strip()
+        AUTO_UPLOAD = bool(data.get("auto_upload", AUTO_UPLOAD))
+    except (OSError, ValueError, TypeError):
+        pass
+
+def _save_target_config():
+    with open(TARGET_CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump({"target_chat_id": TARGET_CHAT_ID, "auto_upload": AUTO_UPLOAD}, f)
+
+_load_target_config()
+
+def _is_owner(message):
+    return bool(message.from_user and OWNER_ID and message.from_user.id == OWNER_ID)
+
+def _destinations(private_chat_id):
+    # Always deliver to the user's private bot chat; add the target only when enabled.
+    result = [private_chat_id]
+    if AUTO_UPLOAD and TARGET_CHAT_ID:
+        target = int(TARGET_CHAT_ID) if TARGET_CHAT_ID.lstrip("-").isdigit() else TARGET_CHAT_ID
+        if target != private_chat_id:
+            result.append(target)
+    return result
+
+def _send_copy_to_destinations(source_chat_id, source_message_id, private_chat_id, reply_to_id=None):
+    for destination in _destinations(private_chat_id):
+        kwargs = {}
+        if destination == private_chat_id and reply_to_id:
+            kwargs["reply_to_message_id"] = reply_to_id
+        safe_call(bot.copy_message, destination, source_chat_id, source_message_id, **kwargs)
+
+
 # Progress status display
 _STATUS_POLL_INTERVAL = 2.0
 _PROGRESS_WRITE_INTERVAL = 1.0
@@ -155,6 +198,49 @@ def send_start(client: pyrogram.client.Client, message: pyrogram.types.messages_
     reply_markup=InlineKeyboardMarkup([[ InlineKeyboardButton("☢️ 𝐁𝐨𝐭 𝐃𝐞𝐯𝐞𝐥𝐨𝐩𝐞𝐫", url="tg://openmessage?user_id=2112247533")]]), reply_to_message_id=message.id)
 
 
+
+@bot.on_message(filters.command(["settarget"]) & filters.private)
+def set_target_command(client, message):
+    global TARGET_CHAT_ID
+    if not _is_owner(message):
+        return safe_call(bot.send_message, message.chat.id, "⛔ Owner only.")
+    if len(message.command) < 2:
+        return safe_call(bot.send_message, message.chat.id,
+                         "Usage: `/settarget -1001234567890` or `/settarget @channelusername`")
+    value = message.command[1].strip()
+    try:
+        TARGET_CHAT_ID = str(int(value)) if value.lstrip("-").isdigit() else value
+        chat = safe_call(bot.get_chat, int(TARGET_CHAT_ID) if TARGET_CHAT_ID.lstrip("-").isdigit() else TARGET_CHAT_ID)
+        _save_target_config()
+        safe_call(bot.send_message, message.chat.id,
+                  f"✅ Target set to **{chat.title or chat.first_name or TARGET_CHAT_ID}** (`{TARGET_CHAT_ID}`).")
+    except Exception as e:
+        TARGET_CHAT_ID = ""
+        safe_call(bot.send_message, message.chat.id,
+                  f"❌ Could not access that chat: `{str(e)[:400]}`\nAdd the bot to the group/channel first and give it posting permission.")
+
+@bot.on_message(filters.command(["mytargets"]) & filters.private)
+def my_targets_command(client, message):
+    if not _is_owner(message):
+        return safe_call(bot.send_message, message.chat.id, "⛔ Owner only.")
+    status = "ON" if AUTO_UPLOAD else "OFF"
+    safe_call(bot.send_message, message.chat.id,
+              f"**Target:** `{TARGET_CHAT_ID or 'Not set'}`\n**Auto upload:** `{status}`")
+
+@bot.on_message(filters.command(["autoupload"]) & filters.private)
+def auto_upload_command(client, message):
+    global AUTO_UPLOAD
+    if not _is_owner(message):
+        return safe_call(bot.send_message, message.chat.id, "⛔ Owner only.")
+    if len(message.command) < 2 or message.command[1].lower() not in ("on", "off"):
+        return safe_call(bot.send_message, message.chat.id, "Usage: `/autoupload on` or `/autoupload off`")
+    if message.command[1].lower() == "on" and not TARGET_CHAT_ID:
+        return safe_call(bot.send_message, message.chat.id, "❌ Set a target first using `/settarget`.")
+    AUTO_UPLOAD = message.command[1].lower() == "on"
+    _save_target_config()
+    safe_call(bot.send_message, message.chat.id,
+              f"✅ Auto upload **{'ON' if AUTO_UPLOAD else 'OFF'}**.")
+
 @bot.on_message(filters.text)
 def save(client: pyrogram.client.Client, message: pyrogram.types.messages_and_media.message.Message):
     """Process each incoming link sequentially; no parallel job executor."""
@@ -238,8 +324,7 @@ def _process_message(client: pyrogram.client.Client, message: pyrogram.types.mes
                 return
 
             try:
-                safe_call(bot.copy_message, message.chat.id, msg.chat.id, msg.id,
-                          reply_to_message_id=message.id)
+                _send_copy_to_destinations(msg.chat.id, msg.id, message.chat.id, message.id)
             except Exception:
                 if acc is None:
                     safe_call(bot.send_message, message.chat.id,
@@ -255,7 +340,11 @@ def handle_private(message: pyrogram.types.messages_and_media.message.Message, c
         msg_type = get_message_type(msg)
 
         if "Text" == msg_type:
-            safe_call(bot.send_message, message.chat.id, msg.text, entities=msg.entities, reply_to_message_id=message.id)
+            for destination in _destinations(message.chat.id):
+                kwargs = {"entities": msg.entities}
+                if destination == message.chat.id:
+                    kwargs["reply_to_message_id"] = message.id
+                safe_call(bot.send_message, destination, msg.text, **kwargs)
             return
 
         smsg = safe_call(bot.send_message, message.chat.id, '**Loading 🔄**', reply_to_message_id=message.id)
@@ -267,42 +356,53 @@ def handle_private(message: pyrogram.types.messages_and_media.message.Message, c
         upsta = threading.Thread(target=lambda:upstatus(f'{message.chat.id}_{message.id}_upstatus.txt',smsg),daemon=True)
         upsta.start()
         
-        if "Document" == msg_type:
-            try:
-                thumb = safe_call(acc.download_media, msg.document.thumbs[0].file_id)
-            except: thumb = None
-            
-            safe_call(bot.send_document, message.chat.id, file, thumb=thumb, caption=msg.caption, caption_entities=msg.caption_entities, reply_to_message_id=message.id, progress=progress, progress_args=[message,"up"])
-            if thumb != None: os.remove(thumb)
+        for destination in _destinations(message.chat.id):
+            reply_id = message.id if destination == message.chat.id else None
+            common = {}
+            if reply_id:
+                common["reply_to_message_id"] = reply_id
+            if "Document" == msg_type:
+                try:
+                    thumb = safe_call(acc.download_media, msg.document.thumbs[0].file_id)
+                except Exception:
+                    thumb = None
+                safe_call(bot.send_document, destination, file, thumb=thumb,
+                          caption=msg.caption, caption_entities=msg.caption_entities,
+                          progress=progress, progress_args=[message, "up"], **common)
+                if thumb and os.path.exists(thumb):
+                    os.remove(thumb)
 
-        elif "Video" == msg_type:
-            try: 
-                thumb = safe_call(acc.download_media, msg.video.thumbs[0].file_id)
-            except: thumb = None
+            elif "Video" == msg_type:
+                try:
+                    thumb = safe_call(acc.download_media, msg.video.thumbs[0].file_id)
+                except Exception:
+                    thumb = None
+                safe_call(bot.send_video, destination, file, duration=msg.video.duration,
+                          width=msg.video.width, height=msg.video.height, thumb=thumb,
+                          caption=msg.caption, caption_entities=msg.caption_entities,
+                          progress=progress, progress_args=[message, "up"], **common)
+                if thumb and os.path.exists(thumb):
+                    os.remove(thumb)
 
-            safe_call(bot.send_video, message.chat.id, file, duration=msg.video.duration, width=msg.video.width, height=msg.video.height, thumb=thumb, caption=msg.caption, caption_entities=msg.caption_entities, reply_to_message_id=message.id, progress=progress, progress_args=[message,"up"])
-            if thumb != None: os.remove(thumb)
+            elif "Animation" == msg_type:
+                safe_call(bot.send_animation, destination, file, caption=msg.caption, **common)
 
-        elif "Animation" == msg_type:
-            safe_call(bot.send_animation, message.chat.id, file, reply_to_message_id=message.id)
-               
-        elif "Sticker" == msg_type:
-            safe_call(bot.send_sticker, message.chat.id, file, reply_to_message_id=message.id)
+            elif "Sticker" == msg_type:
+                safe_call(bot.send_sticker, destination, file, **common)
 
-        elif "Voice" == msg_type:
-            thumb = None
-            safe_call(bot.send_voice, message.chat.id, file, caption=msg.caption, thumb=thumb, caption_entities=msg.caption_entities, reply_to_message_id=message.id, progress=progress, progress_args=[message,"up"])
+            elif "Voice" == msg_type:
+                safe_call(bot.send_voice, destination, file, caption=msg.caption,
+                          caption_entities=msg.caption_entities,
+                          progress=progress, progress_args=[message, "up"], **common)
 
-        elif "Audio" == msg_type:
-            try:
-                thumb = safe_call(acc.download_media, msg.audio.thumbs[0].file_id)
-            except: thumb = None
-                
-            safe_call(bot.send_audio, message.chat.id, file, caption=msg.caption, caption_entities=msg.caption_entities, reply_to_message_id=message.id, progress=progress, progress_args=[message,"up"])   
-            if thumb != None: os.remove(thumb)
+            elif "Audio" == msg_type:
+                safe_call(bot.send_audio, destination, file, caption=msg.caption,
+                          caption_entities=msg.caption_entities,
+                          progress=progress, progress_args=[message, "up"], **common)
 
-        elif "Photo" == msg_type:
-            safe_call(bot.send_photo, message.chat.id, file, caption=msg.caption, caption_entities=msg.caption_entities, reply_to_message_id=message.id)
+            elif "Photo" == msg_type:
+                safe_call(bot.send_photo, destination, file, caption=msg.caption,
+                          caption_entities=msg.caption_entities, **common)
 
         os.remove(file)
         if os.path.exists(f'{message.chat.id}_{message.id}_upstatus.txt'): os.remove(f'{message.chat.id}_{message.id}_upstatus.txt')
@@ -353,6 +453,9 @@ def get_message_type(msg: pyrogram.types.messages_and_media.message.Message):
 
 
 # Heroku config var (optional):
+# OWNER_ID=your_personal_numeric_telegram_id
+# TARGET_CHAT_ID=-1001234567890 (optional)
+# AUTO_UPLOAD=off (optional)
 # MAX_CONCURRENT_TRANSMISSIONS=4
 # This controls Pyrogram's parallel file-transfer parts, not parallel jobs.
 # Start at 4; increasing it may increase memory use or trigger Telegram limits.
@@ -365,6 +468,12 @@ USAGE = """**🈂️ 𝐅𝐨𝐫 𝐏𝐮𝐛𝐥𝐢𝐜 𝐂𝐡𝐚𝐭𝐬 
 
 **🈂️ 𝐌𝐮𝐥𝐭𝐢 𝐏𝐨𝐬𝐭𝐬 🈂️**
 𝚑𝚝𝚝𝚙𝚜://𝚝.𝚖𝚎/𝚌/𝚡𝚡𝚡𝚡/101 - 110
+
+**🎯 Target commands (Owner only)**
+/settarget -1001234567890
+/mytargets
+/autoupload on
+/autoupload off
 """
 
 
