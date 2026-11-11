@@ -491,12 +491,6 @@ USAGE = """**🈂️ 𝐅𝐨𝐫 𝐏𝐮𝐛𝐥𝐢𝐜 𝐂𝐡𝐚𝐭𝐬 
 **🈂️ 𝐌𝐮𝐥𝐭𝐢 𝐏𝐨𝐬𝐭𝐬 🈂️**
 𝚑𝚝𝚝𝚙𝚜://𝚝.𝚖𝚎/𝚌/𝚡𝚡𝚡𝚡/101 - 110
 
-**🎯 Target commands (Anyone can manage the shared target)**
-/settarget -1001234567890
-/mytargets
-/removetarget
-/autoupload on
-/autoupload off
 """
 
 
