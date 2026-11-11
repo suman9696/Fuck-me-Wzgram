@@ -56,10 +56,10 @@ if ss:
 else: acc = None
 
 
-# Destination settings. OWNER_ID must be your personal numeric Telegram ID.
+# Shared destination settings. Anyone can change these using the bot commands.
 OWNER_ID = int(environ.get("OWNER_ID", "0"))
 TARGET_CHAT_ID = environ.get("TARGET_CHAT_ID", "").strip()
-AUTO_UPLOAD = environ.get("AUTO_UPLOAD", "off").lower() == "on"
+AUTO_UPLOAD = True  # Auto Upload is ON by default; no Heroku Config Var needed.
 TARGET_CONFIG_FILE = "target_config.json"
 
 def _load_target_config():
@@ -202,8 +202,6 @@ def send_start(client: pyrogram.client.Client, message: pyrogram.types.messages_
 @bot.on_message(filters.command(["settarget"]) & filters.private)
 def set_target_command(client, message):
     global TARGET_CHAT_ID
-    if not _is_owner(message):
-        return safe_call(bot.send_message, message.chat.id, "⛔ Owner only.")
     if len(message.command) < 2:
         return safe_call(bot.send_message, message.chat.id,
                          "Usage: `/settarget -1001234567890` or `/settarget @channelusername`")
@@ -219,10 +217,23 @@ def set_target_command(client, message):
         safe_call(bot.send_message, message.chat.id,
                   f"❌ Could not access that chat: `{str(e)[:400]}`\nAdd the bot to the group/channel first and give it posting permission.")
 
+@bot.on_message(filters.command(["removetarget"]) & filters.private)
+def remove_target_command(client, message):
+    """Remove the shared destination target and disable automatic forwarding."""
+    global TARGET_CHAT_ID, AUTO_UPLOAD
+    if not TARGET_CHAT_ID:
+        return safe_call(bot.send_message, message.chat.id, "ℹ️ No target is currently configured.")
+
+    old_target = TARGET_CHAT_ID
+    TARGET_CHAT_ID = ""
+    AUTO_UPLOAD = False
+    _save_target_config()
+    safe_call(bot.send_message, message.chat.id,
+              f"✅ Target `{old_target}` removed. Auto upload is now **OFF**.")
+
+
 @bot.on_message(filters.command(["mytargets"]) & filters.private)
 def my_targets_command(client, message):
-    if not _is_owner(message):
-        return safe_call(bot.send_message, message.chat.id, "⛔ Owner only.")
     status = "ON" if AUTO_UPLOAD else "OFF"
     safe_call(bot.send_message, message.chat.id,
               f"**Target:** `{TARGET_CHAT_ID or 'Not set'}`\n**Auto upload:** `{status}`")
@@ -230,8 +241,6 @@ def my_targets_command(client, message):
 @bot.on_message(filters.command(["autoupload"]) & filters.private)
 def auto_upload_command(client, message):
     global AUTO_UPLOAD
-    if not _is_owner(message):
-        return safe_call(bot.send_message, message.chat.id, "⛔ Owner only.")
     if len(message.command) < 2 or message.command[1].lower() not in ("on", "off"):
         return safe_call(bot.send_message, message.chat.id, "Usage: `/autoupload on` or `/autoupload off`")
     if message.command[1].lower() == "on" and not TARGET_CHAT_ID:
@@ -468,7 +477,7 @@ def get_message_type(msg: pyrogram.types.messages_and_media.message.Message):
 # Heroku config var (optional):
 # OWNER_ID=your_personal_numeric_telegram_id
 # TARGET_CHAT_ID=-1001234567890 (optional)
-# AUTO_UPLOAD=off (optional)
+# AUTO_UPLOAD=on (default; optional)
 # MAX_CONCURRENT_TRANSMISSIONS=4
 # This controls Pyrogram's parallel file-transfer parts, not parallel jobs.
 # Start at 4; increasing it may increase memory use or trigger Telegram limits.
@@ -482,9 +491,10 @@ USAGE = """**🈂️ 𝐅𝐨𝐫 𝐏𝐮𝐛𝐥𝐢𝐜 𝐂𝐡𝐚𝐭𝐬 
 **🈂️ 𝐌𝐮𝐥𝐭𝐢 𝐏𝐨𝐬𝐭𝐬 🈂️**
 𝚑𝚝𝚝𝚙𝚜://𝚝.𝚖𝚎/𝚌/𝚡𝚡𝚡𝚡/101 - 110
 
-**🎯 Target commands (Owner only)**
+**🎯 Target commands (Anyone can manage the shared target)**
 /settarget -1001234567890
 /mytargets
+/removetarget
 /autoupload on
 /autoupload off
 """
