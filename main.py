@@ -339,73 +339,86 @@ def handle_private(message: pyrogram.types.messages_and_media.message.Message, c
         msg: pyrogram.types.messages_and_media.message.Message = safe_call(acc.get_messages, chatid, msgid)
         msg_type = get_message_type(msg)
 
+        # Send/upload once to the user's private chat. Then copy Telegram's
+        # already-uploaded message to the target chat (no second upload/progress).
         if "Text" == msg_type:
-            for destination in _destinations(message.chat.id):
-                kwargs = {"entities": msg.entities}
-                if destination == message.chat.id:
-                    kwargs["reply_to_message_id"] = message.id
-                safe_call(bot.send_message, destination, msg.text, **kwargs)
+            sent = safe_call(bot.send_message, message.chat.id, msg.text,
+                             entities=msg.entities, reply_to_message_id=message.id)
+            if AUTO_UPLOAD and TARGET_CHAT_ID:
+                target = int(TARGET_CHAT_ID) if TARGET_CHAT_ID.lstrip("-").isdigit() else TARGET_CHAT_ID
+                if target != message.chat.id:
+                    safe_call(bot.copy_message, target, sent.chat.id, sent.id)
             return
 
         smsg = safe_call(bot.send_message, message.chat.id, '**Loading 🔄**', reply_to_message_id=message.id)
         dosta = threading.Thread(target=lambda:downstatus(f'{message.chat.id}_{message.id}_downstatus.txt',smsg),daemon=True)
         dosta.start()
         file = safe_call(acc.download_media, msg, progress=progress, progress_args=[message,"down"])
-        os.remove(f'{message.chat.id}_{message.id}_downstatus.txt')
+        down_file = f'{message.chat.id}_{message.id}_downstatus.txt'
+        if os.path.exists(down_file):
+            os.remove(down_file)
 
         upsta = threading.Thread(target=lambda:upstatus(f'{message.chat.id}_{message.id}_upstatus.txt',smsg),daemon=True)
         upsta.start()
-        
-        for destination in _destinations(message.chat.id):
-            reply_id = message.id if destination == message.chat.id else None
-            common = {}
-            if reply_id:
-                common["reply_to_message_id"] = reply_id
-            if "Document" == msg_type:
-                try:
-                    thumb = safe_call(acc.download_media, msg.document.thumbs[0].file_id)
-                except Exception:
-                    thumb = None
-                safe_call(bot.send_document, destination, file, thumb=thumb,
-                          caption=msg.caption, caption_entities=msg.caption_entities,
-                          progress=progress, progress_args=[message, "up"], **common)
-                if thumb and os.path.exists(thumb):
-                    os.remove(thumb)
 
-            elif "Video" == msg_type:
-                try:
-                    thumb = safe_call(acc.download_media, msg.video.thumbs[0].file_id)
-                except Exception:
-                    thumb = None
-                safe_call(bot.send_video, destination, file, duration=msg.video.duration,
-                          width=msg.video.width, height=msg.video.height, thumb=thumb,
-                          caption=msg.caption, caption_entities=msg.caption_entities,
-                          progress=progress, progress_args=[message, "up"], **common)
-                if thumb and os.path.exists(thumb):
-                    os.remove(thumb)
+        common = {"reply_to_message_id": message.id}
+        thumb = None
+        if "Document" == msg_type:
+            try:
+                thumb = safe_call(acc.download_media, msg.document.thumbs[0].file_id)
+            except Exception:
+                thumb = None
+            sent = safe_call(bot.send_document, message.chat.id, file, thumb=thumb,
+                             caption=msg.caption, caption_entities=msg.caption_entities,
+                             progress=progress, progress_args=[message, "up"], **common)
 
-            elif "Animation" == msg_type:
-                safe_call(bot.send_animation, destination, file, caption=msg.caption, **common)
+        elif "Video" == msg_type:
+            try:
+                thumb = safe_call(acc.download_media, msg.video.thumbs[0].file_id)
+            except Exception:
+                thumb = None
+            sent = safe_call(bot.send_video, message.chat.id, file, duration=msg.video.duration,
+                             width=msg.video.width, height=msg.video.height, thumb=thumb,
+                             caption=msg.caption, caption_entities=msg.caption_entities,
+                             progress=progress, progress_args=[message, "up"], **common)
 
-            elif "Sticker" == msg_type:
-                safe_call(bot.send_sticker, destination, file, **common)
+        elif "Animation" == msg_type:
+            sent = safe_call(bot.send_animation, message.chat.id, file, caption=msg.caption, **common)
 
-            elif "Voice" == msg_type:
-                safe_call(bot.send_voice, destination, file, caption=msg.caption,
-                          caption_entities=msg.caption_entities,
-                          progress=progress, progress_args=[message, "up"], **common)
+        elif "Sticker" == msg_type:
+            sent = safe_call(bot.send_sticker, message.chat.id, file, **common)
 
-            elif "Audio" == msg_type:
-                safe_call(bot.send_audio, destination, file, caption=msg.caption,
-                          caption_entities=msg.caption_entities,
-                          progress=progress, progress_args=[message, "up"], **common)
+        elif "Voice" == msg_type:
+            sent = safe_call(bot.send_voice, message.chat.id, file, caption=msg.caption,
+                             caption_entities=msg.caption_entities,
+                             progress=progress, progress_args=[message, "up"], **common)
 
-            elif "Photo" == msg_type:
-                safe_call(bot.send_photo, destination, file, caption=msg.caption,
-                          caption_entities=msg.caption_entities, **common)
+        elif "Audio" == msg_type:
+            sent = safe_call(bot.send_audio, message.chat.id, file, caption=msg.caption,
+                             caption_entities=msg.caption_entities,
+                             progress=progress, progress_args=[message, "up"], **common)
 
-        os.remove(file)
-        if os.path.exists(f'{message.chat.id}_{message.id}_upstatus.txt'): os.remove(f'{message.chat.id}_{message.id}_upstatus.txt')
+        elif "Photo" == msg_type:
+            sent = safe_call(bot.send_photo, message.chat.id, file, caption=msg.caption,
+                             caption_entities=msg.caption_entities, **common)
+        else:
+            sent = None
+
+        if thumb and os.path.exists(thumb):
+            os.remove(thumb)
+
+        # Copy the completed upload to the configured destination. This is a
+        # server-side Telegram copy, so the download/upload progress runs once.
+        if sent and AUTO_UPLOAD and TARGET_CHAT_ID:
+            target = int(TARGET_CHAT_ID) if TARGET_CHAT_ID.lstrip("-").isdigit() else TARGET_CHAT_ID
+            if target != message.chat.id:
+                safe_call(bot.copy_message, target, sent.chat.id, sent.id)
+
+        if file and os.path.exists(file):
+            os.remove(file)
+        up_file = f'{message.chat.id}_{message.id}_upstatus.txt'
+        if os.path.exists(up_file):
+            os.remove(up_file)
         safe_call(bot.delete_messages, message.chat.id, [smsg.id])
 
 
