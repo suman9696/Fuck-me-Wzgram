@@ -24,8 +24,16 @@ BOT_TOKEN = environ["TOKEN"]
 API_HASH = environ["HASH"]
 API_ID = int(environ["ID"])
 STRING_SESSION = environ.get("STRING", "").strip()
+# WZGram download tuning.
+# These are moderate starting values for a non-Premium user session.
+# WZGram can still be limited by Telegram/DC routing and Heroku networking.
+environ.setdefault("WZGRAM_DL_POOL_USER", "6")
+environ.setdefault("WZGRAM_DL_WORKERS_USER", "4")
+environ.setdefault("WZGRAM_DL_RATE_USER", "16")
+environ.setdefault("WZGRAM_DL_BURST_USER", "12")
+
 MAX_CONCURRENT_TRANSMISSIONS = int(
-    environ.get("MAX_CONCURRENT_TRANSMISSIONS", "4")
+    environ.get("MAX_CONCURRENT_TRANSMISSIONS", "8")
 )
 
 bot = Client(
