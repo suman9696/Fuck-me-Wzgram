@@ -7,10 +7,6 @@ import time
 import os
 import threading
 import json
-import hmac
-from html import escape
-from flask import Flask, request, Response
-from werkzeug.serving import make_server
 from os import environ
 
 
@@ -498,101 +494,5 @@ USAGE = """**🈂️ 𝐅𝐨𝐫 𝐏𝐮𝐛𝐥𝐢𝐜 𝐂𝐡𝐚𝐭𝐬 
 """
 
 
-# ---------------------------------------------------------------------------
-# Browser dashboard. Set DASHBOARD_PASSWORD in Heroku Config Vars.
-# The web dyno runs this Flask server and the Telegram bot in one process.
-# ---------------------------------------------------------------------------
-app = Flask(__name__)
-_dashboard_jobs = []
-_dashboard_jobs_lock = threading.Lock()
-_dashboard_job_counter = 0
-_dashboard_password = environ.get("DASHBOARD_PASSWORD", "").strip()
-
-
-def _dashboard_required():
-    if not _dashboard_password:
-        return Response("Dashboard disabled: set DASHBOARD_PASSWORD in Heroku Config Vars.", status=503)
-    supplied = request.authorization.password if request.authorization else ""
-    if not hmac.compare_digest(supplied or "", _dashboard_password):
-        return Response("Authentication required", 401,
-                        {"WWW-Authenticate": 'Basic realm="Telegram Upload Dashboard"'})
-    return None
-
-
-def _dashboard_page(message=""):
-    with _dashboard_jobs_lock:
-        jobs = list(reversed(_dashboard_jobs[-20:]))
-    rows = "".join(
-        f"<tr><td>#{j['id']}</td><td>{escape(j['link'])}</td><td>{escape(j['status'])}</td><td>{escape(j.get('detail', ''))}</td></tr>"
-        for j in jobs
-    ) or '<tr><td colspan="4">No browser uploads yet.</td></tr>'
-    target = escape(TARGET_CHAT_ID or "Not configured")
-    auto = "ON" if AUTO_UPLOAD else "OFF"
-    notice = f'<p class="notice">{escape(message)}</p>' if message else ""
-    page = f'''<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Telegram Upload Dashboard</title><style>
-*{{box-sizing:border-box}}body{{margin:0;background:#0b1020;color:#e8edf8;font:15px Arial,sans-serif;padding:24px}}
-.wrap{{max-width:920px;margin:auto}}h1{{margin:0 0 8px}}.muted{{color:#9ba8c4}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px;margin:22px 0}}
-.card,form,.tablebox{{background:#151d33;border:1px solid #283552;border-radius:14px;padding:18px}}.value{{font-size:22px;font-weight:bold;margin-top:8px}}
-input{{width:100%;padding:13px;border-radius:9px;border:1px solid #405071;background:#0d1528;color:white;margin:8px 0 12px}}
-button{{background:#5b7cfa;color:white;border:0;padding:12px 18px;border-radius:9px;font-weight:bold;cursor:pointer}}
-.notice{{background:#1d3150;padding:12px;border-radius:9px}}table{{width:100%;border-collapse:collapse;min-width:600px}}th,td{{text-align:left;padding:12px;border-bottom:1px solid #293550;overflow-wrap:anywhere}}.tablebox{{overflow-x:auto}}
-</style></head><body><div class="wrap"><h1>🚀 Telegram Upload Dashboard</h1><div class="muted">Manage Telegram post uploads from your browser.</div>{notice}
-<div class="grid"><div class="card"><div class="muted">Bot</div><div class="value">🟢 Running</div></div><div class="card"><div class="muted">Auto Upload</div><div class="value">{auto}</div></div><div class="card"><div class="muted">Target Chat</div><div class="value" style="font-size:16px">{target}</div></div></div>
-<form method="post" action="/upload"><h2>📤 Start an upload</h2><label>Telegram post link</label><input name="link" type="url" required placeholder="https://t.me/channel/123"><button type="submit">Start Upload</button></form>
-<div class="tablebox" style="margin-top:20px"><h2>📋 Recent browser uploads</h2><table><thead><tr><th>Job</th><th>Link</th><th>Status</th><th>Details</th></tr></thead><tbody>{rows}</tbody></table></div>
-<p class="muted">Refresh this page to see the latest job status.</p></div></body></html>'''
-    return Response(page, mimetype="text/html")
-
-
-@app.route("/", methods=["GET"])
-def dashboard_home():
-    auth = _dashboard_required()
-    return auth if auth else _dashboard_page()
-
-
-@app.route("/upload", methods=["POST"])
-def dashboard_upload():
-    global _dashboard_job_counter
-    auth = _dashboard_required()
-    if auth:
-        return auth
-    link = (request.form.get("link") or "").strip()
-    if not link.startswith("https://t.me/"):
-        return _dashboard_page("Please enter a valid https://t.me/ post link."), 400
-    if not OWNER_ID:
-        return _dashboard_page("Set OWNER_ID in Heroku Config Vars to enable browser uploads."), 503
-    with _dashboard_jobs_lock:
-        _dashboard_job_counter += 1
-        job = {"id": _dashboard_job_counter, "link": link, "status": "Queued", "detail": "Waiting to start"}
-        _dashboard_jobs.append(job)
-        del _dashboard_jobs[:-50]
-
-    def run_job():
-        try:
-            sent_message = safe_call(bot.send_message, OWNER_ID, link)
-            with _dashboard_jobs_lock:
-                job["status"] = "Processing"
-                job["detail"] = "Processing through the Telegram bot"
-            _process_message(bot, sent_message)
-            with _dashboard_jobs_lock:
-                job["status"] = "Completed"
-                job["detail"] = "Processing finished; check your Telegram chat"
-        except Exception as error:
-            with _dashboard_jobs_lock:
-                job["status"] = "Failed"
-                job["detail"] = str(error)[:250]
-            print(f"Dashboard upload #{job['id']} failed: {error!r}")
-
-    threading.Thread(target=run_job, daemon=True).start()
-    return _dashboard_page(f"Upload job #{job['id']} has been queued.")
-
-
-def _start_dashboard():
-    port = int(environ.get("PORT", "8000"))
-    make_server("0.0.0.0", port, app, threaded=True).serve_forever()
-
-
-if __name__ == "__main__":
-    threading.Thread(target=_start_dashboard, daemon=True).start()
-    bot.run()
+# infinty polling
+bot.run()
