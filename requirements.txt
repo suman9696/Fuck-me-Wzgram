@@ -1,5 +1,1 @@
-wzgram
-TgCrypto
-Flask
-gunicorn==20.1.0
-aiohttp
+
