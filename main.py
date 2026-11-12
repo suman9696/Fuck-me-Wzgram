@@ -1,66 +1,60 @@
-import pyrogram
-from pyrogram import Client, filters
-from pyrogram.errors import UserAlreadyParticipant, InviteHashExpired, UsernameNotOccupied, FloodWait
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+"""Restricted-content mirror bot powered by WZGram (async Pyrogram-compatible API)."""
 
-import time
-import os
-import threading
+import asyncio
 import json
+import os
+import time
 from os import environ
 
-
-def safe_call(function, *args, **kwargs):
-    """Retry the same Telegram API operation after Telegram's FloodWait."""
-    retries = 0
-    while True:
-        try:
-            return function(*args, **kwargs)
-        except FloodWait as error:
-            retries += 1
-            wait_seconds = int(getattr(error, "value", getattr(error, "x", 1)))
-            print(f"FloodWait: sleeping {wait_seconds + 1}s before retry ({retries}/5)")
-            time.sleep(wait_seconds + 1)
-            if retries >= 5:
-                raise
+import pyrogram
+from pyrogram import Client, filters, compose
+from pyrogram.errors import (
+    FloodWait,
+    InviteHashExpired,
+    UserAlreadyParticipant,
+    UsernameNotOccupied,
+)
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 
-bot_token = environ["TOKEN"]
-
-api_hash = environ["HASH"]
-
-api_id = int(environ["ID"])
-
-# Pyrogram's transfer concurrency. Start with 4; increase cautiously if
-# your Heroku dyno has enough CPU, memory and network capacity.
-MAX_CONCURRENT_TRANSMISSIONS = int(environ.get("MAX_CONCURRENT_TRANSMISSIONS", "4"))
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+BOT_TOKEN = environ["TOKEN"]
+API_HASH = environ["HASH"]
+API_ID = int(environ["ID"])
+STRING_SESSION = environ.get("STRING", "").strip()
+MAX_CONCURRENT_TRANSMISSIONS = int(
+    environ.get("MAX_CONCURRENT_TRANSMISSIONS", "4")
+)
 
 bot = Client(
     "mybot",
-    api_id=api_id,
-    api_hash=api_hash,
-    bot_token=bot_token,
-    max_concurrent_transmissions=MAX_CONCURRENT_TRANSMISSIONS
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+    max_concurrent_transmissions=MAX_CONCURRENT_TRANSMISSIONS,
+    sleep_threshold=60,
 )
 
-ss = environ["STRING"]
-if ss:
-    acc = Client(
+acc = (
+    Client(
         "myacc",
-        api_id=api_id,
-        api_hash=api_hash,
-        session_string=ss,
-        max_concurrent_transmissions=MAX_CONCURRENT_TRANSMISSIONS
+        api_id=API_ID,
+        api_hash=API_HASH,
+        session_string=STRING_SESSION,
+        max_concurrent_transmissions=MAX_CONCURRENT_TRANSMISSIONS,
+        sleep_threshold=60,
     )
-    acc.start()
-else: acc = None
+    if STRING_SESSION
+    else None
+)
 
-
-# Shared destination settings. Anyone can change these using the bot commands.
 OWNER_ID = int(environ.get("OWNER_ID", "0"))
 TARGET_CHAT_ID = environ.get("TARGET_CHAT_ID", "").strip()
-AUTO_UPLOAD = True  # Auto Upload is ON by default; no Heroku Config Var needed.
+AUTO_UPLOAD = True
 TARGET_CONFIG_FILE = "target_config.json"
+
 
 def _load_target_config():
     global TARGET_CHAT_ID, AUTO_UPLOAD
@@ -72,427 +66,513 @@ def _load_target_config():
     except (OSError, ValueError, TypeError):
         pass
 
+
 def _save_target_config():
     with open(TARGET_CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump({"target_chat_id": TARGET_CHAT_ID, "auto_upload": AUTO_UPLOAD}, f)
+        json.dump(
+            {"target_chat_id": TARGET_CHAT_ID, "auto_upload": AUTO_UPLOAD},
+            f,
+        )
+
 
 _load_target_config()
 
-def _is_owner(message):
-    return bool(message.from_user and OWNER_ID and message.from_user.id == OWNER_ID)
+
+def _chat_id(value):
+    value = str(value).strip()
+    return int(value) if value.lstrip("-").isdigit() else value
+
+
+async def safe_call(function, *args, **kwargs):
+    """Await a WZGram API call, retrying bounded FloodWait errors."""
+    retries = 0
+    while True:
+        try:
+            return await function(*args, **kwargs)
+        except FloodWait as error:
+            retries += 1
+            wait_seconds = int(
+                getattr(error, "value", getattr(error, "x", 1))
+            )
+            print(f"FloodWait: sleeping {wait_seconds + 1}s ({retries}/5)")
+            if retries >= 5:
+                raise
+            await asyncio.sleep(wait_seconds + 1)
+
 
 def _destinations(private_chat_id):
-    # Always deliver to the user's private bot chat; add the target only when enabled.
+    # Always send to the user's private bot chat; optionally copy to one target.
     result = [private_chat_id]
     if AUTO_UPLOAD and TARGET_CHAT_ID:
-        target = int(TARGET_CHAT_ID) if TARGET_CHAT_ID.lstrip("-").isdigit() else TARGET_CHAT_ID
+        target = _chat_id(TARGET_CHAT_ID)
         if target != private_chat_id:
             result.append(target)
     return result
 
-def _send_copy_to_destinations(source_chat_id, source_message_id, private_chat_id, reply_to_id=None):
+
+async def _send_copy_to_destinations(
+    source_chat_id, source_message_id, private_chat_id, reply_to_id=None
+):
     for destination in _destinations(private_chat_id):
         kwargs = {}
         if destination == private_chat_id and reply_to_id:
             kwargs["reply_to_message_id"] = reply_to_id
-        safe_call(bot.copy_message, destination, source_chat_id, source_message_id, **kwargs)
+        await safe_call(
+            bot.copy_message,
+            destination,
+            source_chat_id,
+            source_message_id,
+            **kwargs,
+        )
 
 
-# Progress status display
-_STATUS_POLL_INTERVAL = 2.0
+# ---------------------------------------------------------------------------
+# Progress display
+# ---------------------------------------------------------------------------
 _PROGRESS_WRITE_INTERVAL = 1.0
 _progress_state = {}
-_progress_lock = threading.Lock()
 
-def _status_worker(statusfile, message, label):
-    last_text = None
-    while True:
-        if os.path.exists(statusfile):
-            break
-        time.sleep(0.2)
 
-    while os.path.exists(statusfile):
-        try:
-            with open(statusfile, "r", encoding="utf-8") as status_file:
-                details = status_file.read().strip()
-            if details and details != last_text:
-                safe_call(bot.edit_message_text,
-                    message.chat.id, message.id,
-                    f"{label}\n{details}"
-                )
-                last_text = details
-        except Exception:
-            # Telegram may reject an unchanged message or briefly be unavailable.
-            pass
-        time.sleep(_STATUS_POLL_INTERVAL)
-
-def downstatus(statusfile, message):
-    _status_worker(statusfile, message, "📥 **DOWNLOADING**")
-
-def upstatus(statusfile, message):
-    _status_worker(statusfile, message, "📤 **UPLOADING**")
-
-def progress(current, total, message, transfer_type):
-    """Render a compact progress bar with transfer speed and ETA."""
+async def progress(current, total, message, transfer_type):
+    """Update the Telegram progress message with percentage, speed and ETA."""
     if not total or total <= 0:
         return
 
     now = time.monotonic()
     key = (message.chat.id, message.id, transfer_type)
-    status_path = f"{message.chat.id}_{message.id}_{transfer_type}status.txt"
-    temp_path = status_path + ".tmp"
+    state = _progress_state.get(key)
+    if state is None:
+        state = {
+            "last_time": now,
+            "last_bytes": current,
+            "speed": 0.0,
+            "last_write": 0.0,
+        }
+        _progress_state[key] = state
 
-    with _progress_lock:
-        state = _progress_state.get(key)
-        if state is None:
-            state = {"last_time": now, "last_bytes": current, "speed": 0.0, "last_write": 0.0}
-            _progress_state[key] = state
-        elapsed = now - state["last_time"]
-        if elapsed > 0.25:
-            instant_speed = max(0, current - state["last_bytes"]) / elapsed
-            # Smooth short-term speed fluctuations.
-            state["speed"] = instant_speed if not state["speed"] else (0.7 * state["speed"] + 0.3 * instant_speed)
-            state["last_time"] = now
-            state["last_bytes"] = current
+    elapsed = now - state["last_time"]
+    if elapsed > 0.25:
+        instant_speed = max(0, current - state["last_bytes"]) / elapsed
+        state["speed"] = (
+            instant_speed
+            if not state["speed"]
+            else 0.7 * state["speed"] + 0.3 * instant_speed
+        )
+        state["last_time"] = now
+        state["last_bytes"] = current
 
-        complete = current >= total
-        if not complete and now - state["last_write"] < _PROGRESS_WRITE_INTERVAL:
-            return
-        state["last_write"] = now
-        speed = state["speed"]
+    complete = current >= total
+    if not complete and now - state["last_write"] < _PROGRESS_WRITE_INTERVAL:
+        return
+    state["last_write"] = now
 
     percent = min(100.0, current * 100.0 / total)
     filled = int(percent // 10)
     bar = "█" * filled + "░" * (10 - filled)
+    speed = state["speed"]
     speed_text = f"{speed / (1024 * 1024):.2f} MB/s" if speed > 0 else "Calculating…"
-    remaining = max(0, total - current)
-    eta_seconds = int(remaining / speed) if speed > 0 else 0
+    eta_seconds = int(max(0, total - current) / speed) if speed > 0 else 0
     if speed > 0:
         minutes, seconds = divmod(eta_seconds, 60)
         eta_text = f"{minutes:02d}:{seconds:02d}"
     else:
         eta_text = "Calculating…"
 
-    details = (
+    label = "📥 **DOWNLOADING**" if transfer_type == "down" else "📤 **UPLOADING**"
+    text = (
+        f"{label}\n"
         f"`{bar}` **{percent:.1f}%**\n"
         f"**Size:** {current / (1024 * 1024):.1f} / {total / (1024 * 1024):.1f} MB\n"
         f"**Speed:** {speed_text}\n"
         f"**ETA:** {eta_text}"
     )
     try:
-        with open(temp_path, "w", encoding="utf-8") as status_file:
-            status_file.write(details)
-        os.replace(temp_path, status_path)
-    except OSError:
+        await bot.edit_message_text(message.chat.id, message.id, text)
+    except Exception:
+        # The next progress callback will retry the edit if Telegram is busy.
         pass
 
     if complete:
-        with _progress_lock:
-            _progress_state.pop(key, None)
+        _progress_state.pop(key, None)
 
 
-# start command
+# ---------------------------------------------------------------------------
+# Bot commands
+# ---------------------------------------------------------------------------
 @bot.on_message(filters.command(["start"]))
-def send_start(client: pyrogram.client.Client, message: pyrogram.types.messages_and_media.message.Message):
-    safe_call(bot.send_message, message.chat.id, f"**♻️ 𝙷𝚒** **{message.from_user.mention}**, **𝐈 𝐚𝐦 𝐒𝐚𝐯𝐞 𝐑𝐞𝐬𝐭𝐫𝐢𝐜𝐭𝐞𝐝 𝐁𝐨𝐭 , 𝐈 𝐜𝐚𝐧 𝐬𝐞𝐧𝐝 𝐲𝐨𝐮 𝐫𝐞𝐬𝐭𝐫𝐢𝐜𝐭𝐞𝐝 𝐜𝐨𝐧𝐭𝐞𝐧𝐭 𝐛𝐲 𝐢𝐭'𝐬 𝐩𝐨𝐬𝐭 𝐥𝐢𝐧𝐤**\n\n{USAGE}",
-    reply_markup=InlineKeyboardMarkup([[ InlineKeyboardButton("☢️ 𝐁𝐨𝐭 𝐃𝐞𝐯𝐞𝐥𝐨𝐩𝐞𝐫", url="tg://openmessage?user_id=2112247533")]]), reply_to_message_id=message.id)
-
+async def send_start(client, message):
+    mention = message.from_user.mention if message.from_user else "there"
+    await safe_call(
+        bot.send_message,
+        message.chat.id,
+        f"**♻️ 𝙷𝚒** **{mention}**, **𝐈 𝐚𝐦 𝐒𝐚𝐯𝐞 𝐑𝐞𝐬𝐭𝐫𝐢𝐜𝐭𝐞𝐝 𝐁𝐨𝐭 , 𝐈 𝐜𝐚𝐧 𝐬𝐞𝐧𝐝 𝐲𝐨𝐮 𝐫𝐞𝐬𝐭𝐫𝐢𝐜𝐭𝐞𝐝 𝐜𝐨𝐧𝐭𝐞𝐧𝐭 𝐛𝐲 𝐢𝐭'𝐬 𝐩𝐨𝐬𝐭 𝐥𝐢𝐧𝐤**\n\n{USAGE}",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("☢️ 𝐁𝐨𝐭 𝐃𝐞𝐯𝐞𝐥𝐨𝐩𝐞𝐫", url="tg://openmessage?user_id=2112247533")]]
+        ),
+        reply_to_message_id=message.id,
+    )
 
 
 @bot.on_message(filters.command(["settarget"]) & filters.private)
-def set_target_command(client, message):
+async def set_target_command(client, message):
     global TARGET_CHAT_ID
     if len(message.command) < 2:
-        return safe_call(bot.send_message, message.chat.id,
-                         "Usage: `/settarget -1001234567890` or `/settarget @channelusername`")
+        return await safe_call(
+            bot.send_message,
+            message.chat.id,
+            "Usage: `/settarget -1001234567890` or `/settarget @channelusername`",
+        )
+
     value = message.command[1].strip()
     try:
-        TARGET_CHAT_ID = str(int(value)) if value.lstrip("-").isdigit() else value
-        chat = safe_call(bot.get_chat, int(TARGET_CHAT_ID) if TARGET_CHAT_ID.lstrip("-").isdigit() else TARGET_CHAT_ID)
+        chat_id = _chat_id(value)
+        chat = await safe_call(bot.get_chat, chat_id)
+        TARGET_CHAT_ID = str(chat.id)
         _save_target_config()
-        safe_call(bot.send_message, message.chat.id,
-                  f"✅ Target set to **{chat.title or chat.first_name or TARGET_CHAT_ID}** (`{TARGET_CHAT_ID}`).")
-    except Exception as e:
-        TARGET_CHAT_ID = ""
-        safe_call(bot.send_message, message.chat.id,
-                  f"❌ Could not access that chat: `{str(e)[:400]}`\nAdd the bot to the group/channel first and give it posting permission.")
+        await safe_call(
+            bot.send_message,
+            message.chat.id,
+            f"✅ Target set to **{chat.title or chat.first_name or TARGET_CHAT_ID}** (`{TARGET_CHAT_ID}`).",
+        )
+    except Exception as error:
+        await safe_call(
+            bot.send_message,
+            message.chat.id,
+            f"❌ Could not access that chat: `{str(error)[:400]}`\nAdd the bot to the group/channel first and give it posting permission.",
+        )
+
 
 @bot.on_message(filters.command(["removetarget"]) & filters.private)
-def remove_target_command(client, message):
-    """Remove the shared destination target and disable automatic forwarding."""
+async def remove_target_command(client, message):
     global TARGET_CHAT_ID, AUTO_UPLOAD
     if not TARGET_CHAT_ID:
-        return safe_call(bot.send_message, message.chat.id, "ℹ️ No target is currently configured.")
+        return await safe_call(
+            bot.send_message, message.chat.id, "ℹ️ No target is currently configured."
+        )
 
     old_target = TARGET_CHAT_ID
     TARGET_CHAT_ID = ""
     AUTO_UPLOAD = False
     _save_target_config()
-    safe_call(bot.send_message, message.chat.id,
-              f"✅ Target `{old_target}` removed. Auto upload is now **OFF**.")
+    await safe_call(
+        bot.send_message,
+        message.chat.id,
+        f"✅ Target `{old_target}` removed. Auto upload is now **OFF**.",
+    )
 
 
 @bot.on_message(filters.command(["mytargets"]) & filters.private)
-def my_targets_command(client, message):
+async def my_targets_command(client, message):
     status = "ON" if AUTO_UPLOAD else "OFF"
-    safe_call(bot.send_message, message.chat.id,
-              f"**Target:** `{TARGET_CHAT_ID or 'Not set'}`\n**Auto upload:** `{status}`")
+    await safe_call(
+        bot.send_message,
+        message.chat.id,
+        f"**Target:** `{TARGET_CHAT_ID or 'Not set'}`\n**Auto upload:** `{status}`",
+    )
+
 
 @bot.on_message(filters.command(["autoupload"]) & filters.private)
-def auto_upload_command(client, message):
+async def auto_upload_command(client, message):
     global AUTO_UPLOAD
     if len(message.command) < 2 or message.command[1].lower() not in ("on", "off"):
-        return safe_call(bot.send_message, message.chat.id, "Usage: `/autoupload on` or `/autoupload off`")
+        return await safe_call(
+            bot.send_message,
+            message.chat.id,
+            "Usage: `/autoupload on` or `/autoupload off`",
+        )
     if message.command[1].lower() == "on" and not TARGET_CHAT_ID:
-        return safe_call(bot.send_message, message.chat.id, "❌ Set a target first using `/settarget`.")
+        return await safe_call(
+            bot.send_message,
+            message.chat.id,
+            "❌ Set a target first using `/settarget`.",
+        )
+
     AUTO_UPLOAD = message.command[1].lower() == "on"
     _save_target_config()
-    safe_call(bot.send_message, message.chat.id,
-              f"✅ Auto upload **{'ON' if AUTO_UPLOAD else 'OFF'}**.")
+    await safe_call(
+        bot.send_message,
+        message.chat.id,
+        f"✅ Auto upload **{'ON' if AUTO_UPLOAD else 'OFF'}**.",
+    )
+
 
 @bot.on_message(filters.text)
-def save(client: pyrogram.client.Client, message: pyrogram.types.messages_and_media.message.Message):
-    """Process each incoming link sequentially; no parallel job executor."""
+async def save(client, message):
+    """Process each incoming link sequentially for this message."""
     try:
-        _process_message(client, message)
-    except FloodWait as error:
-        # Normally handled by safe_call; this catches any FloodWait raised
-        # outside a wrapped API call.
-        wait_seconds = int(getattr(error, "value", getattr(error, "x", 1)))
-        safe_call(time.sleep, wait_seconds + 1)
-        try:
-            _process_message(client, message)
-        except Exception as retry_error:
-            print(f"Task failed after FloodWait retry: {retry_error!r}")
-            try:
-                safe_call(bot.send_message, message.chat.id,
-                          f"❌ **Task failed:** `{str(retry_error)[:700]}`",
-                          reply_to_message_id=message.id)
-            except Exception as send_error:
-                print(f"Could not report task error: {send_error!r}")
+        await _process_message(client, message)
     except Exception as error:
         print(f"Task failed: {error!r}")
         try:
-            safe_call(bot.send_message, message.chat.id,
-                      f"❌ **Task failed:** `{str(error)[:700]}`",
-                      reply_to_message_id=message.id)
+            await safe_call(
+                bot.send_message,
+                message.chat.id,
+                f"❌ **Task failed:** `{str(error)[:700]}`",
+                reply_to_message_id=message.id,
+            )
         except Exception as send_error:
             print(f"Could not report task error: {send_error!r}")
 
 
-def _process_message(client: pyrogram.client.Client, message: pyrogram.types.messages_and_media.message.Message):
-    print(message.text)
+# ---------------------------------------------------------------------------
+# Link processing and restricted/private media handling
+# ---------------------------------------------------------------------------
+async def _process_message(client, message):
+    text = message.text or ""
+    print(text)
 
-    # Joining private chats
-    if "https://t.me/+" in message.text or "https://t.me/joinchat/" in message.text:
+    if "https://t.me/+" in text or "https://t.me/joinchat/" in text:
         if acc is None:
-            safe_call(bot.send_message, message.chat.id, "**String Session is not Set**", reply_to_message_id=message.id)
+            await safe_call(
+                bot.send_message,
+                message.chat.id,
+                "**String Session is not Set**",
+                reply_to_message_id=message.id,
+            )
             return
         try:
-            safe_call(acc.join_chat, message.text)
-            safe_call(bot.send_message, message.chat.id, "**Chat Joined**", reply_to_message_id=message.id)
+            await safe_call(acc.join_chat, text.strip())
+            reply = "**Chat Joined**"
         except UserAlreadyParticipant:
-            safe_call(bot.send_message, message.chat.id, "**Chat already Joined**", reply_to_message_id=message.id)
+            reply = "**Chat already Joined**"
         except InviteHashExpired:
-            safe_call(bot.send_message, message.chat.id, "**Invalid Link**", reply_to_message_id=message.id)
+            reply = "**Invalid Link**"
         except Exception as error:
-            safe_call(bot.send_message, message.chat.id, f"**Error:** __{error}__", reply_to_message_id=message.id)
+            reply = f"**Error:** __{error}__"
+        await safe_call(
+            bot.send_message, message.chat.id, reply, reply_to_message_id=message.id
+        )
         return
 
-    if "https://t.me/" not in message.text:
+    if "https://t.me/" not in text:
         return
 
-    datas = message.text.split("/")
-    temp = datas[-1].replace("?single", "").split("-")
-    fromID = int(temp[0].strip())
-    toID = int(temp[1].strip()) if len(temp) > 1 else fromID
+    datas = text.split("/")
+    try:
+        tail = datas[-1].split("?")[0]
+        ids = tail.split("-")
+        from_id = int(ids[0].strip())
+        to_id = int(ids[1].strip()) if len(ids) > 1 else from_id
+        if to_id < from_id or to_id - from_id > 1000:
+            raise ValueError("Invalid post range (maximum 1001 posts at a time).")
+    except (ValueError, IndexError):
+        await safe_call(
+            bot.send_message,
+            message.chat.id,
+            "❌ Invalid Telegram post link or message range.",
+            reply_to_message_id=message.id,
+        )
+        return
 
-    for msgid in range(fromID, toID + 1):
-        if "https://t.me/c/" in message.text:
-            chatid = int("-100" + datas[4])
+    for msg_id in range(from_id, to_id + 1):
+        if "https://t.me/c/" in text:
+            chat_id = int("-100" + datas[4])
             if acc is None:
-                safe_call(bot.send_message, message.chat.id, "**String Session is not Set**", reply_to_message_id=message.id)
+                await safe_call(
+                    bot.send_message,
+                    message.chat.id,
+                    "**String Session is not Set**",
+                    reply_to_message_id=message.id,
+                )
                 return
-            handle_private(message, chatid, msgid)
+            await handle_private(message, chat_id, msg_id)
 
-        elif "https://t.me/b/" in message.text:
+        elif "https://t.me/b/" in text:
             username = datas[4]
             if acc is None:
-                safe_call(bot.send_message, message.chat.id, "**String Session is not Set**", reply_to_message_id=message.id)
+                await safe_call(
+                    bot.send_message,
+                    message.chat.id,
+                    "**String Session is not Set**",
+                    reply_to_message_id=message.id,
+                )
                 return
-            handle_private(message, username, msgid)
+            await handle_private(message, username, msg_id)
 
         else:
             username = datas[3]
             try:
-                msg = safe_call(bot.get_messages, username, msgid)
+                msg = await safe_call(bot.get_messages, username, msg_id)
             except UsernameNotOccupied:
-                safe_call(bot.send_message, message.chat.id,
-                          "**The username is not occupied by anyone**",
-                          reply_to_message_id=message.id)
+                await safe_call(
+                    bot.send_message,
+                    message.chat.id,
+                    "**The username is not occupied by anyone**",
+                    reply_to_message_id=message.id,
+                )
                 return
 
             try:
-                _send_copy_to_destinations(msg.chat.id, msg.id, message.chat.id, message.id)
+                await _send_copy_to_destinations(
+                    msg.chat.id, msg.id, message.chat.id, message.id
+                )
             except Exception:
                 if acc is None:
-                    safe_call(bot.send_message, message.chat.id,
-                              "**String Session is not Set**",
-                              reply_to_message_id=message.id)
+                    await safe_call(
+                        bot.send_message,
+                        message.chat.id,
+                        "**String Session is not Set**",
+                        reply_to_message_id=message.id,
+                    )
                     return
-                handle_private(message, username, msgid)
+                await handle_private(message, username, msg_id)
 
 
-# handle private
-def handle_private(message: pyrogram.types.messages_and_media.message.Message, chatid: int, msgid: int):
-        msg: pyrogram.types.messages_and_media.message.Message = safe_call(acc.get_messages, chatid, msgid)
-        msg_type = get_message_type(msg)
+async def handle_private(message, chat_id, msg_id):
+    if acc is None:
+        return
 
-        # Send/upload once to the user's private chat. Then copy Telegram's
-        # already-uploaded message to the target chat (no second upload/progress).
-        if "Text" == msg_type:
-            sent = safe_call(bot.send_message, message.chat.id, msg.text,
-                             entities=msg.entities, reply_to_message_id=message.id)
-            if AUTO_UPLOAD and TARGET_CHAT_ID:
-                target = int(TARGET_CHAT_ID) if TARGET_CHAT_ID.lstrip("-").isdigit() else TARGET_CHAT_ID
-                if target != message.chat.id:
-                    safe_call(bot.copy_message, target, sent.chat.id, sent.id)
-            return
+    msg = await safe_call(acc.get_messages, chat_id, msg_id)
+    msg_type = get_message_type(msg)
 
-        smsg = safe_call(bot.send_message, message.chat.id, '**Loading 🔄**', reply_to_message_id=message.id)
-        dosta = threading.Thread(target=lambda:downstatus(f'{message.chat.id}_{message.id}_downstatus.txt',smsg),daemon=True)
-        dosta.start()
-        file = safe_call(acc.download_media, msg, progress=progress, progress_args=[message,"down"])
-        down_file = f'{message.chat.id}_{message.id}_downstatus.txt'
-        if os.path.exists(down_file):
-            os.remove(down_file)
+    if msg_type == "Text":
+        sent = await safe_call(
+            bot.send_message,
+            message.chat.id,
+            msg.text,
+            entities=msg.entities,
+            reply_to_message_id=message.id,
+        )
+        if AUTO_UPLOAD and TARGET_CHAT_ID:
+            target = _chat_id(TARGET_CHAT_ID)
+            if target != message.chat.id:
+                await safe_call(bot.copy_message, target, sent.chat.id, sent.id)
+        return
 
-        upsta = threading.Thread(target=lambda:upstatus(f'{message.chat.id}_{message.id}_upstatus.txt',smsg),daemon=True)
-        upsta.start()
+    status_message = await safe_call(
+        bot.send_message,
+        message.chat.id,
+        "📥 **Preparing download…**",
+        reply_to_message_id=message.id,
+    )
+    file_path = None
+    thumb_path = None
+    try:
+        file_path = await safe_call(
+            acc.download_media,
+            msg,
+            progress=progress,
+            progress_args=(status_message, "down"),
+        )
+        if not file_path:
+            raise RuntimeError("WZGram could not download this media.")
+
+        media = getattr(msg, msg_type.lower(), None)
+        if msg_type in ("Document", "Video"):
+            try:
+                thumbs = getattr(media, "thumbs", None) if media else None
+                if thumbs:
+                    thumb_path = await safe_call(acc.download_media, thumbs[0].file_id)
+            except Exception:
+                thumb_path = None
 
         common = {"reply_to_message_id": message.id}
-        thumb = None
-        if "Document" == msg_type:
-            try:
-                thumb = safe_call(acc.download_media, msg.document.thumbs[0].file_id)
-            except Exception:
-                thumb = None
-            sent = safe_call(bot.send_document, message.chat.id, file, thumb=thumb,
-                             caption=msg.caption, caption_entities=msg.caption_entities,
-                             progress=progress, progress_args=[message, "up"], **common)
+        caption = msg.caption
+        caption_entities = msg.caption_entities
+        upload_progress = {
+            "progress": progress,
+            "progress_args": (status_message, "up"),
+        }
 
-        elif "Video" == msg_type:
-            try:
-                thumb = safe_call(acc.download_media, msg.video.thumbs[0].file_id)
-            except Exception:
-                thumb = None
-            sent = safe_call(bot.send_video, message.chat.id, file, duration=msg.video.duration,
-                             width=msg.video.width, height=msg.video.height, thumb=thumb,
-                             caption=msg.caption, caption_entities=msg.caption_entities,
-                             progress=progress, progress_args=[message, "up"], **common)
-
-        elif "Animation" == msg_type:
-            sent = safe_call(bot.send_animation, message.chat.id, file, caption=msg.caption, **common)
-
-        elif "Sticker" == msg_type:
-            sent = safe_call(bot.send_sticker, message.chat.id, file, **common)
-
-        elif "Voice" == msg_type:
-            sent = safe_call(bot.send_voice, message.chat.id, file, caption=msg.caption,
-                             caption_entities=msg.caption_entities,
-                             progress=progress, progress_args=[message, "up"], **common)
-
-        elif "Audio" == msg_type:
-            sent = safe_call(bot.send_audio, message.chat.id, file, caption=msg.caption,
-                             caption_entities=msg.caption_entities,
-                             progress=progress, progress_args=[message, "up"], **common)
-
-        elif "Photo" == msg_type:
-            sent = safe_call(bot.send_photo, message.chat.id, file, caption=msg.caption,
-                             caption_entities=msg.caption_entities, **common)
+        if msg_type == "Document":
+            sent = await safe_call(
+                bot.send_document,
+                message.chat.id,
+                file_path,
+                thumb=thumb_path,
+                caption=caption,
+                caption_entities=caption_entities,
+                **upload_progress,
+                **common,
+            )
+        elif msg_type == "Video":
+            sent = await safe_call(
+                bot.send_video,
+                message.chat.id,
+                file_path,
+                duration=msg.video.duration,
+                width=msg.video.width,
+                height=msg.video.height,
+                thumb=thumb_path,
+                caption=caption,
+                caption_entities=caption_entities,
+                **upload_progress,
+                **common,
+            )
+        elif msg_type == "Animation":
+            sent = await safe_call(
+                bot.send_animation, message.chat.id, file_path,
+                caption=caption, caption_entities=caption_entities, **common
+            )
+        elif msg_type == "Sticker":
+            sent = await safe_call(bot.send_sticker, message.chat.id, file_path, **common)
+        elif msg_type == "Voice":
+            sent = await safe_call(
+                bot.send_voice, message.chat.id, file_path,
+                caption=caption, caption_entities=caption_entities,
+                **upload_progress, **common
+            )
+        elif msg_type == "Audio":
+            sent = await safe_call(
+                bot.send_audio, message.chat.id, file_path,
+                caption=caption, caption_entities=caption_entities,
+                **upload_progress, **common
+            )
+        elif msg_type == "Photo":
+            sent = await safe_call(
+                bot.send_photo, message.chat.id, file_path,
+                caption=caption, caption_entities=caption_entities, **common
+            )
         else:
-            sent = None
+            raise RuntimeError(f"Unsupported media type: {msg_type}")
 
-        if thumb and os.path.exists(thumb):
-            os.remove(thumb)
-
-        # Copy the completed upload to the configured destination. This is a
-        # server-side Telegram copy, so the download/upload progress runs once.
         if sent and AUTO_UPLOAD and TARGET_CHAT_ID:
-            target = int(TARGET_CHAT_ID) if TARGET_CHAT_ID.lstrip("-").isdigit() else TARGET_CHAT_ID
+            target = _chat_id(TARGET_CHAT_ID)
             if target != message.chat.id:
-                safe_call(bot.copy_message, target, sent.chat.id, sent.id)
+                await safe_call(bot.copy_message, target, sent.chat.id, sent.id)
+    finally:
+        for path in (thumb_path, file_path):
+            if path and isinstance(path, str) and os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+        try:
+            await safe_call(bot.delete_messages, message.chat.id, [status_message.id])
+        except Exception:
+            pass
 
-        if file and os.path.exists(file):
-            os.remove(file)
-        up_file = f'{message.chat.id}_{message.id}_upstatus.txt'
-        if os.path.exists(up_file):
-            os.remove(up_file)
-        safe_call(bot.delete_messages, message.chat.id, [smsg.id])
 
-
-# get the type of message
-def get_message_type(msg: pyrogram.types.messages_and_media.message.Message):
-    try:
-        msg.document.file_id
-        return "Document"
-    except: pass
-
-    try:
-        msg.video.file_id
-        return "Video"
-    except: pass
-
-    try:
-        msg.animation.file_id
-        return "Animation"
-    except: pass
-
-    try:
-        msg.sticker.file_id
-        return "Sticker"
-    except: pass
-
-    try:
-        msg.voice.file_id
-        return "Voice"
-    except: pass
-
-    try:
-        msg.audio.file_id
-        return "Audio"
-    except: pass
-
-    try:
-        msg.photo.file_id
-        return "Photo"
-    except: pass
-
-    try:
-        msg.text
+def get_message_type(msg):
+    for attribute, label in (
+        ("document", "Document"),
+        ("video", "Video"),
+        ("animation", "Animation"),
+        ("sticker", "Sticker"),
+        ("voice", "Voice"),
+        ("audio", "Audio"),
+        ("photo", "Photo"),
+    ):
+        if getattr(msg, attribute, None):
+            return label
+    if msg.text:
         return "Text"
-    except: pass
+    return None
 
-
-# Heroku config var (optional):
-# OWNER_ID=your_personal_numeric_telegram_id
-# TARGET_CHAT_ID=-1001234567890 (optional)
-# AUTO_UPLOAD=on (default; optional)
-# MAX_CONCURRENT_TRANSMISSIONS=4
-# This controls Pyrogram's parallel file-transfer parts, not parallel jobs.
-# Start at 4; increasing it may increase memory use or trigger Telegram limits.
 
 USAGE = """**🈂️ 𝐅𝐨𝐫 𝐏𝐮𝐛𝐥𝐢𝐜 𝐂𝐡𝐚𝐭𝐬 🈂️**
 𝐉𝐮𝐬𝐭 𝐒𝐞𝐧𝐝 𝐏𝐨𝐬𝐭/𝐬 𝐋𝐢𝐧𝐤
 
 **🈂️ 𝐅𝐨𝐫 𝐏𝐫𝐢𝐯𝐚𝐭𝐞 𝐂𝐡𝐚𝐭𝐬 🈂️**
-𝐟𝐢𝐫𝐬𝐭 𝐬𝐞𝐧𝐝 𝐢𝐧𝐯𝐢𝐭𝐞 𝐥𝐢𝐧𝐤 𝐨𝐟 𝐭𝐡𝐞 𝐜𝐡𝐚𝐭 (𝐮𝐧𝐧𝐞𝐜𝐞𝐬𝐬𝐚𝐫𝐲 𝐢𝐟 𝐭𝐡𝐞 𝐚𝐜𝐜𝐨𝐮𝐧𝐭 𝐨𝐟 𝐬𝐭𝐫𝐢𝐧𝐠 𝐬𝐞𝐬𝐬𝐢𝐨𝐧 𝐚𝐥𝐫𝐞𝐚𝐝𝐲 𝐦𝐞𝐦𝐛𝐞𝐫 𝐨𝐟 𝐭𝐡𝐞 𝐜𝐡𝐚𝐭) 𝐭𝐡𝐞𝐧 𝐬𝐞𝐧𝐝 𝐩𝐨𝐬𝐭/𝐬 𝐥𝐢𝐧𝐤
+𝐅𝐢𝐫𝐬𝐭 𝐬𝐞𝐧𝐝 𝐚𝐧 𝐢𝐧𝐯𝐢𝐭𝐞 𝐥𝐢𝐧𝐤 𝐨𝐟 𝐭𝐡𝐞 𝐜𝐡𝐚𝐭 (𝐮𝐧𝐧𝐞𝐜𝐞𝐬𝐬𝐚𝐫𝐲 𝐢𝐟 𝐭𝐡𝐞 𝐚𝐜𝐜𝐨𝐮𝐧𝐭 𝐨𝐟 𝐬𝐭𝐫𝐢𝐧𝐠 𝐬𝐞𝐬𝐬𝐢𝐨𝐧 𝐢𝐬 𝐚𝐥𝐫𝐞𝐚𝐝𝐲 𝐚 𝐦𝐞𝐦𝐛𝐞𝐫) 𝐭𝐡𝐞𝐧 𝐬𝐞𝐧𝐝 𝐭𝐡𝐞 𝐩𝐨𝐬𝐭 𝐥𝐢𝐧𝐤.
 
 **🈂️ 𝐌𝐮𝐥𝐭𝐢 𝐏𝐨𝐬𝐭𝐬 🈂️**
-𝚑𝚝𝚝𝚙𝚜://𝚝.𝚖𝚎/𝚌/𝚡𝚡𝚡𝚡/101 - 110
-
+https://t.me/channel/101-110
 """
 
 
-# infinty polling
-bot.run()
+if __name__ == "__main__":
+    # compose() starts both clients on the same asyncio event loop and keeps
+    # them running until the process is stopped.
+    clients = [bot, acc] if acc is not None else [bot]
+    bot.run(compose(clients))
