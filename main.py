@@ -1,5 +1,8 @@
+# WZGram is a Pyrogram-compatible replacement.
+# Client and filters are imported from WZGram; the pyrogram namespace below
+# remains available for compatible error classes and type annotations.
 import pyrogram
-from pyrogram import Client, filters
+from wzgram import Client, filters
 from pyrogram.errors import UserAlreadyParticipant, InviteHashExpired, UsernameNotOccupied, FloodWait
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
@@ -31,7 +34,7 @@ api_hash = environ["HASH"]
 
 api_id = int(environ["ID"])
 
-# Pyrogram's transfer concurrency. Start with 4; increase cautiously if
+# WZGram's transfer concurrency. Start with 4; increase cautiously if
 # your Heroku dyno has enough CPU, memory and network capacity.
 MAX_CONCURRENT_TRANSMISSIONS = int(environ.get("MAX_CONCURRENT_TRANSMISSIONS", "4"))
 
@@ -195,7 +198,7 @@ def progress(current, total, message, transfer_type):
 @bot.on_message(filters.command(["start"]))
 def send_start(client: pyrogram.client.Client, message: pyrogram.types.messages_and_media.message.Message):
     safe_call(bot.send_message, message.chat.id, f"**♻️ 𝙷𝚒** **{message.from_user.mention}**, **𝐈 𝐚𝐦 𝐒𝐚𝐯𝐞 𝐑𝐞𝐬𝐭𝐫𝐢𝐜𝐭𝐞𝐝 𝐁𝐨𝐭 , 𝐈 𝐜𝐚𝐧 𝐬𝐞𝐧𝐝 𝐲𝐨𝐮 𝐫𝐞𝐬𝐭𝐫𝐢𝐜𝐭𝐞𝐝 𝐜𝐨𝐧𝐭𝐞𝐧𝐭 𝐛𝐲 𝐢𝐭'𝐬 𝐩𝐨𝐬𝐭 𝐥𝐢𝐧𝐤**\n\n{USAGE}",
-    reply_markup=InlineKeyboardMarkup([[ InlineKeyboardButton("☢️ 𝐁𝐨𝐭 𝐃𝐞𝐯𝐞𝐥𝐨𝐩𝐞𝐫", url="tg://openmessage?user_id=2112247533")]]), reply_to_message_id=message.id)
+    reply_markup=InlineKeyboardMarkup([[ InlineKeyboardButton("☢️ 𝐁𝐨𝐭 𝐃𝐞𝐯𝐞𝐥𝐨𝐩𝐞𝐫", url="tg://openmessage?user_id=7771180127")]]), reply_to_message_id=message.id)
 
 
 
@@ -264,20 +267,25 @@ def save(client: pyrogram.client.Client, message: pyrogram.types.messages_and_me
             _process_message(client, message)
         except Exception as retry_error:
             print(f"Task failed after FloodWait retry: {retry_error!r}")
+            # Do not send noisy Telegram alerts for posts that simply have
+            # no downloadable media (for example, service/empty posts).
+            if "doesn't contain any downloadable media" not in str(retry_error).lower():
+                try:
+                    safe_call(bot.send_message, message.chat.id,
+                              f"❌ **Task failed:** `{str(retry_error)[:700]}`",
+                              reply_to_message_id=message.id)
+                except Exception as send_error:
+                    print(f"Could not report task error: {send_error!r}")
+    except Exception as error:
+        print(f"Task failed: {error!r}")
+        # Suppress only the unwanted no-downloadable-media notification.
+        if "doesn't contain any downloadable media" not in str(error).lower():
             try:
                 safe_call(bot.send_message, message.chat.id,
-                          f"❌ **Task failed:** `{str(retry_error)[:700]}`",
+                          f"❌ **Task failed:** `{str(error)[:700]}`",
                           reply_to_message_id=message.id)
             except Exception as send_error:
                 print(f"Could not report task error: {send_error!r}")
-    except Exception as error:
-        print(f"Task failed: {error!r}")
-        try:
-            safe_call(bot.send_message, message.chat.id,
-                      f"❌ **Task failed:** `{str(error)[:700]}`",
-                      reply_to_message_id=message.id)
-        except Exception as send_error:
-            print(f"Could not report task error: {send_error!r}")
 
 
 def _process_message(client: pyrogram.client.Client, message: pyrogram.types.messages_and_media.message.Message):
@@ -307,46 +315,90 @@ def _process_message(client: pyrogram.client.Client, message: pyrogram.types.mes
     fromID = int(temp[0].strip())
     toID = int(temp[1].strip()) if len(temp) > 1 else fromID
 
+    # Process each post independently. A missing/unsupported post must not
+    # terminate the rest of a multi-post range.
     for msgid in range(fromID, toID + 1):
-        if "https://t.me/c/" in message.text:
-            chatid = int("-100" + datas[4])
-            if acc is None:
-                safe_call(bot.send_message, message.chat.id, "**String Session is not Set**", reply_to_message_id=message.id)
-                return
-            handle_private(message, chatid, msgid)
-
-        elif "https://t.me/b/" in message.text:
-            username = datas[4]
-            if acc is None:
-                safe_call(bot.send_message, message.chat.id, "**String Session is not Set**", reply_to_message_id=message.id)
-                return
-            handle_private(message, username, msgid)
-
-        else:
-            username = datas[3]
-            try:
-                msg = safe_call(bot.get_messages, username, msgid)
-            except UsernameNotOccupied:
-                safe_call(bot.send_message, message.chat.id,
-                          "**The username is not occupied by anyone**",
-                          reply_to_message_id=message.id)
-                return
-
-            try:
-                _send_copy_to_destinations(msg.chat.id, msg.id, message.chat.id, message.id)
-            except Exception:
+        try:
+            if "https://t.me/c/" in message.text:
+                chatid = int("-100" + datas[4])
                 if acc is None:
-                    safe_call(bot.send_message, message.chat.id,
-                              "**String Session is not Set**",
-                              reply_to_message_id=message.id)
+                    safe_call(
+                        bot.send_message, message.chat.id,
+                        "**String Session is not Set**",
+                        reply_to_message_id=message.id
+                    )
+                    return
+                handle_private(message, chatid, msgid)
+
+            elif "https://t.me/b/" in message.text:
+                username = datas[4]
+                if acc is None:
+                    safe_call(
+                        bot.send_message, message.chat.id,
+                        "**String Session is not Set**",
+                        reply_to_message_id=message.id
+                    )
                     return
                 handle_private(message, username, msgid)
+
+            else:
+                username = datas[3]
+                try:
+                    msg = safe_call(bot.get_messages, username, msgid)
+                except UsernameNotOccupied:
+                    safe_call(
+                        bot.send_message, message.chat.id,
+                        "**The username is not occupied by anyone**",
+                        reply_to_message_id=message.id
+                    )
+                    return
+
+                # Public posts are copied directly when possible. If the bot
+                # cannot access/copy a post, use the logged-in user session.
+                try:
+                    if not msg or getattr(msg, "empty", False):
+                        print(f"Post {msgid}: empty or unavailable; skipped.")
+                        continue
+                    _send_copy_to_destinations(
+                        msg.chat.id, msg.id, message.chat.id, message.id
+                    )
+                except Exception as copy_error:
+                    print(f"Post {msgid}: bot copy failed: {copy_error!r}")
+                    if acc is None:
+                        print(f"Post {msgid}: no user session; skipped.")
+                        continue
+                    try:
+                        handle_private(message, username, msgid)
+                    except Exception as fallback_error:
+                        print(
+                            f"Post {msgid}: user-session fallback failed: "
+                            f"{fallback_error!r}"
+                        )
+        except Exception as post_error:
+            # Isolate errors to this post and continue with the next ID.
+            print(f"Post {msgid} failed; continuing: {post_error!r}")
+            continue
 
 
 # handle private
 def handle_private(message: pyrogram.types.messages_and_media.message.Message, chatid: int, msgid: int):
-        msg: pyrogram.types.messages_and_media.message.Message = safe_call(acc.get_messages, chatid, msgid)
+        if acc is None:
+            print(f"Post {msgid}: user session is not configured; skipped.")
+            return
+
+        msg = safe_call(acc.get_messages, chatid, msgid)
+        if not msg or getattr(msg, "empty", False):
+            print(f"Post {msgid}: empty/deleted message; skipped.")
+            return
+
         msg_type = get_message_type(msg)
+
+        # Some Telegram posts are service/action messages and contain no
+        # downloadable media or normal text. Skip them without raising an
+        # exception, so the multi-post loop can continue.
+        if msg_type is None:
+            print(f"Post {msgid}: no supported media or text; skipped.")
+            return
 
         # Send/upload once to the user's private chat. Then copy Telegram's
         # already-uploaded message to the target chat (no second upload/progress).
@@ -363,6 +415,11 @@ def handle_private(message: pyrogram.types.messages_and_media.message.Message, c
         dosta = threading.Thread(target=lambda:downstatus(f'{message.chat.id}_{message.id}_downstatus.txt',smsg),daemon=True)
         dosta.start()
         file = safe_call(acc.download_media, msg, progress=progress, progress_args=[message,"down"])
+        if not file:
+            print(f"Post {msgid}: Telegram returned no downloaded file; skipped.")
+            safe_call(bot.delete_messages, message.chat.id, [smsg.id])
+            return
+
         down_file = f'{message.chat.id}_{message.id}_downstatus.txt'
         if os.path.exists(down_file):
             os.remove(down_file)
@@ -479,7 +536,7 @@ def get_message_type(msg: pyrogram.types.messages_and_media.message.Message):
 # TARGET_CHAT_ID=-1001234567890 (optional)
 # AUTO_UPLOAD=on (default; optional)
 # MAX_CONCURRENT_TRANSMISSIONS=4
-# This controls Pyrogram's parallel file-transfer parts, not parallel jobs.
+# This controls WZGram's parallel file-transfer parts, not parallel jobs.
 # Start at 4; increasing it may increase memory use or trigger Telegram limits.
 
 USAGE = """**🈂️ 𝐅𝐨𝐫 𝐏𝐮𝐛𝐥𝐢𝐜 𝐂𝐡𝐚𝐭𝐬 🈂️**
