@@ -14,7 +14,7 @@ from os import environ
 
 
 def safe_call(function, *args, **kwargs):
-    """Retry the same Telegram API operation after Telegram's FloodWait."""
+    """Retry Telegram FloodWait responses without changing the operation."""
     retries = 0
     while True:
         try:
@@ -28,15 +28,70 @@ def safe_call(function, *args, **kwargs):
                 raise
 
 
+def _is_connection_error(error):
+    """Recognize common temporary Telegram/network connection failures."""
+    name = type(error).__name__.lower()
+    detail = str(error).lower()
+    return (
+        isinstance(error, (ConnectionError, TimeoutError))
+        or name in {"connectionclosed", "connectionclosederror", "networkerror"}
+        or any(text in detail for text in (
+            "connection closed", "connection reset", "connection aborted",
+            "server disconnected", "timed out", "network is unreachable"
+        ))
+    )
+
+
+def safe_read_call(function, *args, **kwargs):
+    """
+    Retry read/download operations after temporary connection failures.
+    Do not use this wrapper for send/upload operations, because replaying a
+    send after a lost response could create duplicate Telegram messages.
+    """
+    for attempt in range(1, 4):
+        try:
+            return safe_call(function, *args, **kwargs)
+        except Exception as error:
+            if not _is_connection_error(error) or attempt == 3:
+                raise
+            delay = min(2 ** attempt, 8)
+            print(
+                f"Temporary connection error in {getattr(function, '__name__', 'Telegram call')}: "
+                f"{error!r}. Retrying in {delay}s ({attempt}/3)."
+            )
+            time.sleep(delay)
+
+
+def _is_no_downloadable_media_error(error):
+    detail = str(error).lower()
+    return (
+        "doesn't contain any downloadable media" in detail
+        or "does not contain any downloadable media" in detail
+    )
+
+
+def _cleanup_status_message(chat_id, status_message_id, *status_paths):
+    for path in status_paths:
+        try:
+            if path and os.path.exists(path):
+                os.remove(path)
+        except OSError as cleanup_error:
+            print(f"Could not remove status file {path}: {cleanup_error!r}")
+    try:
+        safe_call(bot.delete_messages, chat_id, [status_message_id])
+    except Exception as cleanup_error:
+        print(f"Could not remove transfer status message: {cleanup_error!r}")
+
+
 bot_token = environ["TOKEN"]
 
 api_hash = environ["HASH"]
 
 api_id = int(environ["ID"])
 
-# WZGram's transfer concurrency. Start with 4; increase cautiously if
-# your Heroku dyno has enough CPU, memory and network capacity.
-MAX_CONCURRENT_TRANSMISSIONS = int(environ.get("MAX_CONCURRENT_TRANSMISSIONS", "4"))
+# Lower concurrency helps reduce simultaneous upload-part FloodWaits.
+# Set the Heroku Config Var MAX_CONCURRENT_TRANSMISSIONS=2 to override this.
+MAX_CONCURRENT_TRANSMISSIONS = int(environ.get("MAX_CONCURRENT_TRANSMISSIONS", "2"))
 
 bot = Client(
     "mybot",
@@ -109,9 +164,12 @@ _progress_lock = threading.Lock()
 
 def _status_worker(statusfile, message, label):
     last_text = None
-    while True:
-        if os.path.exists(statusfile):
-            break
+    # Do not leave a background thread waiting forever if a transfer fails
+    # before its first progress callback.
+    wait_deadline = time.monotonic() + 120
+    while not os.path.exists(statusfile):
+        if time.monotonic() >= wait_deadline:
+            return
         time.sleep(0.2)
 
     while os.path.exists(statusfile):
@@ -253,39 +311,43 @@ def auto_upload_command(client, message):
     safe_call(bot.send_message, message.chat.id,
               f"✅ Auto upload **{'ON' if AUTO_UPLOAD else 'OFF'}**.")
 
+# Serialize separate incoming link jobs too, so multiple users/messages do
+# not start competing downloads and uploads at the same time.
+_job_lock = threading.Lock()
+
+
 @bot.on_message(filters.text)
 def save(client: pyrogram.client.Client, message: pyrogram.types.messages_and_media.message.Message):
-    """Process each incoming link sequentially; no parallel job executor."""
-    try:
-        _process_message(client, message)
-    except FloodWait as error:
-        # Normally handled by safe_call; this catches any FloodWait raised
-        # outside a wrapped API call.
-        wait_seconds = int(getattr(error, "value", getattr(error, "x", 1)))
-        safe_call(time.sleep, wait_seconds + 1)
+    """Process incoming links one job at a time."""
+    with _job_lock:
         try:
             _process_message(client, message)
-        except Exception as retry_error:
-            print(f"Task failed after FloodWait retry: {retry_error!r}")
-            # Do not send noisy Telegram alerts for posts that simply have
-            # no downloadable media (for example, service/empty posts).
-            if "doesn't contain any downloadable media" not in str(retry_error).lower():
+        except FloodWait as error:
+            # Normally handled by safe_call; this catches any FloodWait raised
+            # outside a wrapped API call.
+            wait_seconds = int(getattr(error, "value", getattr(error, "x", 1)))
+            time.sleep(wait_seconds + 1)
+            try:
+                _process_message(client, message)
+            except Exception as retry_error:
+                print(f"Task failed after FloodWait retry: {retry_error!r}")
+                if not _is_no_downloadable_media_error(retry_error):
+                    try:
+                        safe_call(bot.send_message, message.chat.id,
+                                  f"❌ **Task failed:** `{str(retry_error)[:700]}`",
+                                  reply_to_message_id=message.id)
+                    except Exception as send_error:
+                        print(f"Could not report task error: {send_error!r}")
+        except Exception as error:
+            print(f"Task failed: {error!r}")
+            # Never send the unwanted no-downloadable-media notification.
+            if not _is_no_downloadable_media_error(error):
                 try:
                     safe_call(bot.send_message, message.chat.id,
-                              f"❌ **Task failed:** `{str(retry_error)[:700]}`",
+                              f"❌ **Task failed:** `{str(error)[:700]}`",
                               reply_to_message_id=message.id)
                 except Exception as send_error:
                     print(f"Could not report task error: {send_error!r}")
-    except Exception as error:
-        print(f"Task failed: {error!r}")
-        # Suppress only the unwanted no-downloadable-media notification.
-        if "doesn't contain any downloadable media" not in str(error).lower():
-            try:
-                safe_call(bot.send_message, message.chat.id,
-                          f"❌ **Task failed:** `{str(error)[:700]}`",
-                          reply_to_message_id=message.id)
-            except Exception as send_error:
-                print(f"Could not report task error: {send_error!r}")
 
 
 def _process_message(client: pyrogram.client.Client, message: pyrogram.types.messages_and_media.message.Message):
@@ -344,7 +406,7 @@ def _process_message(client: pyrogram.client.Client, message: pyrogram.types.mes
             else:
                 username = datas[3]
                 try:
-                    msg = safe_call(bot.get_messages, username, msgid)
+                    msg = safe_read_call(bot.get_messages, username, msgid)
                 except UsernameNotOccupied:
                     safe_call(
                         bot.send_message, message.chat.id,
@@ -386,7 +448,7 @@ def handle_private(message: pyrogram.types.messages_and_media.message.Message, c
             print(f"Post {msgid}: user session is not configured; skipped.")
             return
 
-        msg = safe_call(acc.get_messages, chatid, msgid)
+        msg = safe_read_call(acc.get_messages, chatid, msgid)
         if not msg or getattr(msg, "empty", False):
             print(f"Post {msgid}: empty/deleted message; skipped.")
             return
@@ -414,13 +476,29 @@ def handle_private(message: pyrogram.types.messages_and_media.message.Message, c
         smsg = safe_call(bot.send_message, message.chat.id, '**Loading 🔄**', reply_to_message_id=message.id)
         dosta = threading.Thread(target=lambda:downstatus(f'{message.chat.id}_{message.id}_downstatus.txt',smsg),daemon=True)
         dosta.start()
-        file = safe_call(acc.download_media, msg, progress=progress, progress_args=[message,"down"])
+        down_file = f'{message.chat.id}_{message.id}_downstatus.txt'
+        up_file = f'{message.chat.id}_{message.id}_upstatus.txt'
+        try:
+            file = safe_read_call(
+                acc.download_media, msg,
+                progress=progress, progress_args=[message, "down"]
+            )
+        except Exception as download_error:
+            _cleanup_status_message(
+                message.chat.id, smsg.id, down_file, up_file
+            )
+            if _is_no_downloadable_media_error(download_error):
+                print(f"Post {msgid}: no downloadable media; skipped silently.")
+                return
+            raise
+
         if not file:
             print(f"Post {msgid}: Telegram returned no downloaded file; skipped.")
-            safe_call(bot.delete_messages, message.chat.id, [smsg.id])
+            _cleanup_status_message(
+                message.chat.id, smsg.id, down_file, up_file
+            )
             return
 
-        down_file = f'{message.chat.id}_{message.id}_downstatus.txt'
         if os.path.exists(down_file):
             os.remove(down_file)
 
@@ -431,7 +509,7 @@ def handle_private(message: pyrogram.types.messages_and_media.message.Message, c
         thumb = None
         if "Document" == msg_type:
             try:
-                thumb = safe_call(acc.download_media, msg.document.thumbs[0].file_id)
+                thumb = safe_read_call(acc.download_media, msg.document.thumbs[0].file_id)
             except Exception:
                 thumb = None
             sent = safe_call(bot.send_document, message.chat.id, file, thumb=thumb,
@@ -440,7 +518,7 @@ def handle_private(message: pyrogram.types.messages_and_media.message.Message, c
 
         elif "Video" == msg_type:
             try:
-                thumb = safe_call(acc.download_media, msg.video.thumbs[0].file_id)
+                thumb = safe_read_call(acc.download_media, msg.video.thumbs[0].file_id)
             except Exception:
                 thumb = None
             sent = safe_call(bot.send_video, message.chat.id, file, duration=msg.video.duration,
@@ -526,18 +604,19 @@ def get_message_type(msg: pyrogram.types.messages_and_media.message.Message):
     except: pass
 
     try:
-        msg.text
-        return "Text"
-    except: pass
+        if getattr(msg, "text", None):
+            return "Text"
+    except Exception:
+        pass
 
 
 # Heroku config var (optional):
 # OWNER_ID=your_personal_numeric_telegram_id
 # TARGET_CHAT_ID=-1001234567890 (optional)
 # AUTO_UPLOAD=on (default; optional)
-# MAX_CONCURRENT_TRANSMISSIONS=4
+# MAX_CONCURRENT_TRANSMISSIONS=2
 # This controls WZGram's parallel file-transfer parts, not parallel jobs.
-# Start at 4; increasing it may increase memory use or trigger Telegram limits.
+# Start at 2; increasing it may increase FloodWaits and memory use.
 
 USAGE = """**🈂️ 𝐅𝐨𝐫 𝐏𝐮𝐛𝐥𝐢𝐜 𝐂𝐡𝐚𝐭𝐬 🈂️**
 𝐉𝐮𝐬𝐭 𝐒𝐞𝐧𝐝 𝐏𝐨𝐬𝐭/𝐬 𝐋𝐢𝐧𝐤
